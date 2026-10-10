@@ -2,11 +2,11 @@
 
 **Rahul Reddy Koulury | Backend / Python Developer assessment**
 
-This is my implementation of the Order & Inventory Service assessment. I focused on correct stock updates under concurrency, bounded database connections, and indexed search.
+An API for managing products, stock and orders, with concurrent reporting and indexed product search.
 
 The FastAPI backend is shared by three concurrent consumers — a read-heavy **storefront**, a **warehouse** app that writes stock, and a heavy **reporting** job — all on one PostgreSQL database, with near-instant product search served from **RediSearch**.
 
-The focus is correctness under concurrency: no over-selling, no deadlocks, no connection exhaustion, and slow reports that can't starve order placement.
+Orders use transactions and row locks to prevent over-selling. Reporting uses a separate connection pool to keep slow queries from consuming the connections reserved for orders.
 
 ---
 
@@ -146,9 +146,9 @@ I chose SQLAlchemy 2.0 `AsyncEngine` on `asyncpg`, with **two separate bounded c
 | Server `statement_timeout` | 5 s | 30 s |
 | Transaction mode | READ COMMITTED (default) | **REPEATABLE READ, READ ONLY** |
 
-### Why this prevents exhaustion
+### Connection budget
 
-The number of Postgres connections the service can ever open is fixed and calculable:
+With the configured two workers, the maximum application connection count is:
 
 ```
 workers × (OLTP max + reporting max) = 2 × (20 + 3) = 46   <   max_connections = 100
@@ -178,7 +178,7 @@ Warehouse adjustments use a single atomic statement, `UPDATE … SET stock = sto
 
 ### Alternatives considered
 
-- **PgBouncer (transaction pooling)** in front of Postgres. This is the right next step when many app instances share one database: it caps server connections globally rather than per process. It isn't needed at this scale, prepared-statement behavior would need validation with the selected driver and pooling configuration before adopting it.
+- **PgBouncer (transaction pooling)** in front of Postgres. This is the right next step when many app instances share one database: it caps server connections globally rather than per process. I have not added it for this local setup. Prepared-statement behavior would need validation with the selected driver and pooling configuration before adopting it.
 - **Read replica for reporting.** The cleanest isolation in production (reports never touch the primary). Out of scope for a local stack; the separate reporting engine is already the seam where a replica URL would plug in.
 
 ---
@@ -248,10 +248,10 @@ Additional checks:
 - An order completed in 16.85 ms while 12 slow reports were pending; all reports subsequently succeeded.
 - A synchronized mix of 50 orders and 20 restocks produced stock `40 = 50 + (20 * 2) - 50`.
 - Product metadata updates, description search, filters, pagination, warehouse changes, multi-product rollback, invalid inputs and historical order-price snapshots passed HTTP checks.
-- Testing found that an explicit null product name caused a 500 response. I added validation for all four update fields. Final live checks returned 422 for each null field and confirmed that omitted fields and rejected updates left the product unchanged.
+- Explicit null values for all four product-update fields returned 422. Omitted fields and rejected updates left the product unchanged.
 - During a temporary Redis outage, product creation still returned 201. After restart, reindexing restored the missing search result and health returned to OK.
 
-The final checks are recorded in [FINAL_REVIEW.md](FINAL_REVIEW.md), with detailed evidence in [review-evidence/TEST_RESULTS.md](review-evidence/TEST_RESULTS.md). The detailed report preserves the original null-update failure; the final review records its resolution. Large-catalog search latency was not benchmarked.
+Large-catalog search latency was not benchmarked.
 
 ---
 
