@@ -1,7 +1,5 @@
 # Order & Inventory Service
 
-**Rahul Reddy Koulury | Backend / Python Developer assessment**
-
 An API for managing products, stock and orders, with concurrent reporting and indexed product search.
 
 The FastAPI backend is shared by three concurrent consumers — a read-heavy **storefront**, a **warehouse** app that writes stock, and a heavy **reporting** job — all on one PostgreSQL database, with near-instant product search served from **RediSearch**.
