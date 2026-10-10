@@ -1,7 +1,7 @@
 from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ---------- Products (storefront + warehouse) ----------
@@ -21,6 +21,19 @@ class ProductUpdate(BaseModel):
     description: str | None = None
     category: str | None = Field(default=None, max_length=100)
     price: Decimal | None = Field(default=None, ge=0, max_digits=12, decimal_places=2)
+
+    @model_validator(mode="after")
+    def reject_explicit_nulls(self):
+        """Omitted fields stay unchanged; explicit nulls are invalid updates."""
+        null_fields = [
+            field for field in self.model_fields_set
+            if getattr(self, field) is None
+        ]
+        if null_fields:
+            raise ValueError(
+                "update fields cannot be null: " + ", ".join(sorted(null_fields))
+            )
+        return self
 
 
 class StockAdjustment(BaseModel):
