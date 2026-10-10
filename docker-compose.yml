@@ -8,7 +8,7 @@ services:
     # max_connections is the hard ceiling the app's pool budget is sized against.
     command: ["postgres", "-c", "max_connections=100"]
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -21,7 +21,7 @@ services:
     # redis-stack-server bundles the RediSearch module (FT.CREATE / FT.SEARCH).
     image: redis/redis-stack-server:7.4.0-v1
     ports:
-      - "6379:6379"
+      - "6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s

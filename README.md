@@ -1,6 +1,10 @@
 # Order & Inventory Service
 
-A FastAPI backend shared by three concurrent consumers — a read-heavy **storefront**, a **warehouse** app that writes stock, and a heavy **reporting** job — all on one PostgreSQL database, with near-instant product search served from **RediSearch**.
+**Rahul Reddy Koulury | Backend / Python Developer assessment**
+
+This is my implementation of the Order & Inventory Service assessment. I focused on correct stock updates under concurrency, bounded database connections, and indexed search.
+
+The FastAPI backend is shared by three concurrent consumers — a read-heavy **storefront**, a **warehouse** app that writes stock, and a heavy **reporting** job — all on one PostgreSQL database, with near-instant product search served from **RediSearch**.
 
 The focus is correctness under concurrency: no over-selling, no deadlocks, no connection exhaustion, and slow reports that can't starve order placement.
 
@@ -8,7 +12,9 @@ The focus is correctness under concurrency: no over-selling, no deadlocks, no co
 
 ## Quick start
 
-Requirements: Docker with Docker Compose.
+Prerequisite: Docker with Docker Compose installed and running (Docker Desktop with Linux containers on Windows). Open a terminal in this project's root folder, alongside `docker-compose.yml`.
+
+The following single command builds and starts the complete stack. A separate startup script or local Python environment is not required. The first build needs internet access to download images and dependencies.
 
 ```bash
 docker compose up --build
@@ -19,20 +25,28 @@ That starts three services:
 | Service    | Image                               | Port |
 |------------|-------------------------------------|------|
 | `api`      | built from `Dockerfile` (2 uvicorn workers) | 8000 |
-| `postgres` | `postgres:16-alpine`                | 5432 |
-| `redis`    | `redis/redis-stack-server` (includes RediSearch) | 6379 |
+| `postgres` | `postgres:16-alpine`                | 5433 (host), 5432 (container) |
+| `redis`    | `redis/redis-stack-server` (includes RediSearch) | 6380 (host), 6379 (container) |
 
 Tables are created and the search index is built automatically on startup.
 
 - Swagger UI: http://localhost:8000/docs
 - Health: http://localhost:8000/health
 
+If port 8000 is already occupied, the included isolated preview can be started with:
+
+```powershell
+docker compose -p uploaded-inventory-preview -f compose.preview.yaml up -d --build
+```
+
+Its Swagger interface is at http://localhost:8001/docs. Use port 8001 for tests against this configuration. The default Compose configuration persists PostgreSQL data in `pgdata`; the preview does not declare a persistent database volume. Stop the default stack with `docker compose stop`.
+
 ### Run the load test
 
-In a second terminal, with the stack running:
+Startup and testing are separate operations. With the stack running, use a second terminal with Python 3.12 available. Install the development dependencies before running either unit tests or the load test:
 
 ```bash
-pip install -r requirements-dev.txt
+python -m pip install -r requirements-dev.txt
 python scripts/load_test.py
 ```
 
@@ -41,10 +55,12 @@ Options: `--orders`, `--hot-stock`, `--pair-orders`, `--pair-stock`, `--reports`
 ### Unit tests
 
 ```bash
-pytest -q
+python -m pytest -q
 ```
 
 ### Try it by hand
+
+Swagger at `/docs` provides **Try it out** and **Execute** controls for each endpoint. The examples below use Bash syntax. Use the actual product ID returned by creation in the order request; ID 1 is only an example. Use a fresh SKU on repeat runs. Manual testing does not need to run inside Docker.
 
 ```bash
 # create a product
@@ -52,7 +68,7 @@ curl -X POST localhost:8000/products -H 'content-type: application/json' \
   -d '{"sku":"KB-1","name":"Mechanical Keyboard","description":"RGB backlit, hot-swap switches","category":"peripherals","price":"89.90","stock":5}'
 
 # search (served by Redis, not Postgres)
-curl 'localhost:8000/products/search?q=mech key&in_stock=true'
+curl 'localhost:8000/products/search?q=mech%20key&in_stock=true'
 
 # place an order
 curl -X POST localhost:8000/orders -H 'content-type: application/json' \
@@ -71,7 +87,7 @@ curl localhost:8000/reports/sales
 | `POST` | `/products` | warehouse | Create. 409 on duplicate SKU. Indexed for search after commit. |
 | `GET` | `/products` | storefront | Paged list (`limit`, `offset`). |
 | `GET` | `/products/{id}` | storefront | |
-| `PATCH` | `/products/{id}` | warehouse | Partial update of name/description/category/price. Re-indexed. |
+| `PATCH` | `/products/{id}` | warehouse | Partial update of name/description/category/price. Omitted fields stay unchanged; explicit null returns 422. Re-indexed. |
 | `POST` | `/products/{id}/stock` | warehouse | `{"delta": n}` restock (+) or write-off (−). 409 if it would go negative. |
 | `GET` | `/products/search` | storefront | `q`, `category`, `min_price`, `max_price`, `in_stock`, `limit`, `offset`. RediSearch only. |
 | `POST` | `/orders` | storefront | One or more items, all-or-nothing. 201 / 404 / 409 insufficient stock / 503 retry. |
@@ -109,7 +125,7 @@ app/
     search.py        RediSearch index, sync and querying          ← search strategy
   api/               thin routers: validate → call service → schedule index sync
 scripts/load_test.py
-tests/               unit tests for the search query builder
+tests/               search query and product-update regression tests
 ```
 
 Routers stay thin; all database and Redis logic lives in services, so it can be tested or reused (e.g. from a worker) without HTTP.
@@ -120,7 +136,7 @@ Every endpoint is `async`, and every I/O call is awaited through async drivers (
 
 ## Connection handling
 
-**Choice:** SQLAlchemy 2.0 `AsyncEngine` on `asyncpg`, with **two separate bounded connection pools** — one for transactional traffic and one reserved for reporting. All settings are in `app/core/config.py` and overridable by environment variable.
+I chose SQLAlchemy 2.0 `AsyncEngine` on `asyncpg`, with **two separate bounded connection pools** — one for transactional traffic and one reserved for reporting. All settings are in `app/core/config.py` and overridable by environment variable.
 
 | | OLTP pool | Reporting pool |
 |---|---|---|
@@ -140,9 +156,9 @@ workers × (OLTP max + reporting max) = 2 × (20 + 3) = 46   <   max_connections
 
 Leftover capacity covers `psql` sessions, migrations, and a rolling restart that briefly runs old and new processes side by side. When traffic exceeds pool capacity, requests **wait in the pool queue** (cheap, in-process) instead of opening more connections. If they wait longer than `pool_timeout`, they fail fast with 503 rather than hanging — back-pressure instead of collapse. `pool_pre_ping` and `pool_recycle` replace connections that Postgres or the network dropped.
 
-### Why heavy queries can't block others
+### Isolating heavy reports
 
-- **Bulkhead.** Reports get their own 3-connection pool. Twenty slow reports arriving at once can only occupy 3 connections per worker; the rest queue for *reporting* connections, while order placement and storefront reads keep using the untouched OLTP pool. The load test shows this directly: orders all finish in well under a second while reports are still queued behind each other.
+- **Bulkhead.** Reports get their own 3-connection pool. Twenty slow reports arriving at once can only occupy 3 connections per worker; the rest queue for *reporting* connections, while order placement and storefront reads keep using the untouched OLTP pool. A separate overlap check completed an order in 16.85 ms while 12 slow reports were still pending. This isolates pool capacity; reports can still compete for shared database CPU and I/O.
 - **MVCC.** Reports are plain reads, and in Postgres readers never block writers. REPEATABLE READ gives every figure in one report the same snapshot, so totals add up even while orders commit mid-report.
 - **Timeouts.** `statement_timeout` is set server-side per pool, so a runaway query is killed by Postgres instead of pinning a connection forever.
 
@@ -162,14 +178,14 @@ Warehouse adjustments use a single atomic statement, `UPDATE … SET stock = sto
 
 ### Alternatives considered
 
-- **PgBouncer (transaction pooling)** in front of Postgres. This is the right next step when many app instances share one database: it caps server connections globally rather than per process. It isn't needed at this scale, and with asyncpg it requires disabling prepared-statement caching (`statement_cache_size=0`) — a real cost. The pools here are sized so it can be added later without code changes beyond that one setting.
+- **PgBouncer (transaction pooling)** in front of Postgres. This is the right next step when many app instances share one database: it caps server connections globally rather than per process. It isn't needed at this scale, prepared-statement behavior would need validation with the selected driver and pooling configuration before adopting it.
 - **Read replica for reporting.** The cleanest isolation in production (reports never touch the primary). Out of scope for a local stack; the separate reporting engine is already the seam where a replica URL would plug in.
 
 ---
 
 ## Product search
 
-**Choice:** **RediSearch** (the Redis Stack search module), with Postgres remaining the source of truth.
+I chose **RediSearch** (the Redis Stack search module), with Postgres remaining the source of truth.
 
 ### How it works
 
@@ -204,54 +220,38 @@ User input is tokenised rather than passed through: every word becomes a prefix 
 
 ---
 
-## Load test results
+## Testing and observed results
 
-`scripts/load_test.py` seeds fresh products, then releases at the same instant:
+The local verification on 10 October 2026 used two Uvicorn workers, PostgreSQL 16 and Redis Stack in Docker. The final unit and regression run passed **12 tests in 0.59 seconds**.
 
-- **100** single-item orders against a product with **50** in stock
-- **40** two-item orders against two products with **30** each, items in **random order** (deadlock bait)
-- **20** reports, each holding its connection ≥ 1 s (`simulate_slow_ms=1000`) plus the real aggregation
-- a storefront probe calling `GET /products/{id}` every 20 ms throughout
+`scripts/load_test.py` launches 100 single-item order attempts against stock 50, 40 two-item attempts against stock 30 per product, and 20 slow reports together. A storefront probe runs throughout. The script checks successful order counts, final stock, retrieved order quantities, report success and storefront p95 below 500 ms. Tests leave their products and orders in the database.
 
-**Expected outcome:** exactly 50 single-item orders and 30 two-item orders succeed, the rest get 409, all three products end at stock 0, the units in the confirmed orders match the stock that left, there are no deadlocks or 5xx errors, every report completes, and storefront reads stay fast.
+Observed results:
 
-Observed run (2 uvicorn workers, Postgres 16, on a development machine):
+- Single-item orders: 50 created, 50 rejected with 409.
+- Two-item orders: 30 created, 10 rejected with 409.
+- All three load-test products ended at stock 0; confirmed order quantities matched stock deductions.
+- All 20 reports and all 195 storefront probes returned 200.
+- No unexpected order responses were observed.
+- Total run time: 8.24 seconds.
 
-```
-Results
-  Single-item orders: 50 created, 50 rejected (409 out of stock), 0 other
-  Two-item orders:    30 created
-  Reports:            20/20 succeeded
-  Final stock:        HOT=0, PAIR1=0, PAIR2=0
-  Orders finished in 0.66s; whole run 5.33s
+| Endpoint | p50 ms | p95 ms | p99 ms | Maximum ms |
+|---|---:|---:|---:|---:|
+| POST /orders | 3016.2 | 3357.1 | 3369.4 | 3372.0 |
+| GET /reports/sales | 6138.9 | 8165.3 | 8166.8 | 8166.8 |
+| Storefront reads | 5.0 | 9.6 | 13.5 | 3056.7 |
 
-Checks
-  PASS  HOT: exactly 50 orders succeeded (got 50)
-  PASS  HOT: final stock 0 == 50 - 50
-  PASS  HOT: stock never negative
-  PASS  HOT: units in confirmed orders (50) == successful orders
-  PASS  PAIR: exactly 30 two-item orders succeeded (got 30)
-  PASS  PAIR: both products at 0 (got 0, 0)
-  PASS  PAIR: order items match stock movement
-  PASS  No unexpected order status codes
-  PASS  All reports completed while orders were running
-  PASS  Storefront reads stayed responsive (p95 8 ms < 500 ms)
+The p95 check passed, but the slowest storefront read took about 3.06 seconds. These results demonstrate the tested workload, not that every request stays fast under arbitrary load. Functional checks were also active on separate products during this run. The script's `orders_done` timestamp covers single-item tasks; its report-success assertion alone does not prove completion overlap.
 
-Latency (ms)
-  endpoint                             n      p50      p95      p99      max
-  POST /orders                       140    544.6    732.3    746.5    748.7
-  GET /reports/sales                  20   2225.2   5175.5   5262.4   5262.4
-  GET /products/{id} (probe)         188      4.1      7.6     33.0    518.4
-```
+Additional checks:
 
-**What the numbers show**
+- An order completed in 16.85 ms while 12 slow reports were pending; all reports subsequently succeeded.
+- A synchronized mix of 50 orders and 20 restocks produced stock `40 = 50 + (20 * 2) - 50`.
+- Product metadata updates, description search, filters, pagination, warehouse changes, multi-product rollback, invalid inputs and historical order-price snapshots passed HTTP checks.
+- Testing found that an explicit null product name caused a 500 response. I added validation for all four update fields. Final live checks returned 422 for each null field and confirmed that omitted fields and rejected updates left the product unchanged.
+- During a temporary Redis outage, product creation still returned 201. After restart, reindexing restored the missing search result and health returned to OK.
 
-- **No over-selling and no deadlocks**, including the random-order two-item orders.
-- **The bulkhead works.** All 140 orders finished in 0.66 s, while the 20 slow reports took up to ~5 s — they were queuing for the 6 reporting connections (2 workers × 3), not for the order connections. Without the separate pool, those reports would have held most of the shared pool for seconds at a time and orders would have queued behind them.
-- **Storefront reads stayed fast** (p95 ≈ 8 ms) throughout.
-- **Order latency is dominated by serialisation on the hot row.** 100 requests for the same product must take its lock one at a time; that's the deliberate price of correctness.
-
-A heavier run (`--orders 500 --hot-stock 200 --pair-orders 200 --pair-stock 120 --reports 40`) also passed every check: 200 / 120 orders succeeded, all stock ended at 0, no 503s, probe p95 6 ms. With 700 orders in flight the OLTP pools were briefly saturated, and one probe request waited ~2.6 s for a connection; that is the pool queue doing its job (no connection storm, no errors), and it is the point at which you would add API instances behind PgBouncer.
+The final checks are recorded in [FINAL_REVIEW.md](FINAL_REVIEW.md), with detailed evidence in [review-evidence/TEST_RESULTS.md](review-evidence/TEST_RESULTS.md). The detailed report preserves the original null-update failure; the final review records its resolution. Large-catalog search latency was not benchmarked.
 
 ---
 
@@ -261,7 +261,7 @@ A heavier run (`--orders 500 --hot-stock 200 --pair-orders 200 --pair-stock 120 
 - Orders are confirmed immediately (no payment step — out of scope). The `status` column exists so cancellations or pending states can be added.
 - A product appears at most once per order; quantity per line is 1–1000; up to 50 lines per order.
 - Stock is changed only by orders and the dedicated stock endpoint, not by `PATCH /products/{id}`, so every stock movement goes through a concurrency-safe path.
-- Search results may lag Postgres by milliseconds; this is acceptable for browsing because orders re-check stock.
+- Search results may lag Postgres, particularly after failed or out-of-order background writes; this is acceptable for browsing because orders re-check stock.
 - `simulate_slow_ms` on the report endpoint is a testing aid; in production I'd remove it or hide it behind a flag.
 
 ## What I'd do with more time
